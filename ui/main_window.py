@@ -6,23 +6,18 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, QSortFilterProxyModel, QTimer
-from PySide6.QtGui import QStandardItem, QStandardItemModel, QAction, QKeySequence
-from PySide6.QtWidgets import QHeaderView
+from PySide6.QtCore import Qt, QSortFilterProxyModel
+from PySide6.QtGui import QStandardItem, QStandardItemModel, QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
-    QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QSplitter,
     QStatusBar,
     QTableView,
@@ -32,47 +27,7 @@ from PySide6.QtWidgets import (
 
 from schematic import Schematic
 
-
-# ---------------------------------------------------------------------------
-# Replace dialog
-# ---------------------------------------------------------------------------
-
-class ReplaceDialog(QDialog):
-    def __init__(self, old_name: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Replace Block")
-        self.setMinimumWidth(420)
-
-        layout = QVBoxLayout(self)
-
-        info = QLabel(f"Replacing: <b>{old_name}</b>")
-        info.setTextFormat(Qt.RichText)
-        layout.addWidget(info)
-
-        form = QFormLayout()
-        self.new_name_edit = QLineEdit()
-        self.new_name_edit.setPlaceholderText("e.g. minecraft:stone")
-        form.addRow("New block ID:", self.new_name_edit)
-        layout.addLayout(form)
-
-        note = QLabel(
-            "<small>Use the full namespaced ID (mod:block_name).<br>"
-            "Block properties (orientation, shape…) are preserved.</small>"
-        )
-        note.setTextFormat(Qt.RichText)
-        layout.addWidget(note)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        self.new_name_edit.returnPressed.connect(self.accept)
-
-    def new_name(self) -> str:
-        return self.new_name_edit.text().strip()
+_UNDO_LIMIT = 50
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +63,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.schematic: Schematic | None = None
         self._dirty = False
+
+        # undo/redo stacks: each entry is (description: str, snapshot: dict)
+        self._undo_stack: list[tuple[str, dict]] = []
+        self._redo_stack: list[tuple[str, dict]] = []
 
         self.setWindowTitle("BG2 Schematic Editor")
         self.resize(900, 600)
@@ -147,6 +106,16 @@ class MainWindow(QMainWindow):
         quit_act.setShortcut(QKeySequence.StandardKey.Quit)
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
+
+        edit_menu = menu.addMenu("&Edit")
+
+        self.undo_act = QAction("&Undo\tCtrl+Z", self)
+        self.undo_act.triggered.connect(self._on_undo)
+        edit_menu.addAction(self.undo_act)
+
+        self.redo_act = QAction("&Redo\tCtrl+Y", self)
+        self.redo_act.triggered.connect(self._on_redo)
+        edit_menu.addAction(self.redo_act)
 
     def _build_ui(self):
         central = QWidget()
@@ -194,6 +163,18 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
+
+        # All three shortcuts fire only when the table has focus,
+        # so QLineEdit keeps its own native Ctrl+Z text-undo.
+        for key, slot in [
+            (QKeySequence(Qt.Key.Key_Delete),          self._on_remove),
+            (QKeySequence.StandardKey.Undo,            self._on_undo),
+            (QKeySequence.StandardKey.Redo,            self._on_redo),
+        ]:
+            sc = QShortcut(QKeySequence(key), self.table)
+            sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc.activated.connect(slot)
+
         left_layout.addWidget(self.table)
 
         splitter.addWidget(left)
@@ -220,6 +201,7 @@ class MainWindow(QMainWindow):
         replace_layout = QVBoxLayout(replace_group)
         self.replace_edit = QLineEdit()
         self.replace_edit.setPlaceholderText("mod:block_name")
+        self.replace_edit.returnPressed.connect(self._on_replace)
         replace_layout.addWidget(self.replace_edit)
         note = QLabel("<small>Properties (shape, axis…) are preserved.</small>")
         note.setTextFormat(Qt.RichText)
@@ -231,7 +213,7 @@ class MainWindow(QMainWindow):
 
         # Remove button
         self.remove_btn = QPushButton("Remove Block (→ Air)")
-        self.remove_btn.setToolTip("Replace every occurrence of this block with air")
+        self.remove_btn.setToolTip("Replace every occurrence of this block with air  [Del]")
         self.remove_btn.clicked.connect(self._on_remove)
         right_layout.addWidget(self.remove_btn)
 
@@ -266,6 +248,17 @@ class MainWindow(QMainWindow):
         self.save_as_act.setEnabled(has_file)
         self.replace_btn.setEnabled(False)
         self.remove_btn.setEnabled(False)
+
+        can_undo = has_file and bool(self._undo_stack)
+        can_redo = has_file and bool(self._redo_stack)
+        self.undo_act.setEnabled(can_undo)
+        self.redo_act.setEnabled(can_redo)
+        self.undo_act.setText(
+            f"&Undo  {self._undo_stack[-1][0]}" if can_undo else "&Undo"
+        )
+        self.redo_act.setText(
+            f"&Redo  {self._redo_stack[-1][0]}" if can_redo else "&Redo"
+        )
 
         if not has_file:
             self.file_label.setText("No file loaded.")
@@ -308,6 +301,40 @@ class MainWindow(QMainWindow):
         self._refresh_ui()
 
     # ------------------------------------------------------------------
+    # Undo / redo helpers
+    # ------------------------------------------------------------------
+
+    def _push_undo(self, description: str):
+        """Snapshot current schematic state onto the undo stack."""
+        snap = self.schematic.snapshot()
+        self._undo_stack.append((description, snap))
+        if len(self._undo_stack) > _UNDO_LIMIT:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _on_undo(self):
+        if not self.schematic or not self._undo_stack:
+            return
+        desc, before_snap = self._undo_stack.pop()
+        after_snap = self.schematic.snapshot()
+        self._redo_stack.append((desc, after_snap))
+        self.schematic.restore(before_snap)
+        self._dirty = True
+        self._refresh_ui()
+        self.status_bar.showMessage(f"Undid: {desc}", 3000)
+
+    def _on_redo(self):
+        if not self.schematic or not self._redo_stack:
+            return
+        desc, after_snap = self._redo_stack.pop()
+        before_snap = self.schematic.snapshot()
+        self._undo_stack.append((desc, before_snap))
+        self.schematic.restore(after_snap)
+        self._dirty = True
+        self._refresh_ui()
+        self.status_bar.showMessage(f"Redid: {desc}", 3000)
+
+    # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
 
@@ -320,6 +347,8 @@ class MainWindow(QMainWindow):
         try:
             self.schematic = Schematic.load(path)
             self._dirty = False
+            self._undo_stack.clear()
+            self._redo_stack.clear()
             self._refresh_ui()
             self.status_bar.showMessage(f"Loaded: {path}", 4000)
         except Exception as exc:
@@ -365,7 +394,6 @@ class MainWindow(QMainWindow):
             self.selected_count_label.setText(f"{count:,} block(s)")
             self.replace_btn.setEnabled(True)
             self.remove_btn.setEnabled(True)
-            self.replace_edit.setFocus()
         else:
             self.selected_label.setText("—")
             self.selected_count_label.setText("")
@@ -396,6 +424,7 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("Old and new names are identical – nothing to do.", 3000)
             return
 
+        self._push_undo(f"Replace '{name}'")
         self.schematic.replace_block(name, new_name)
         self.replace_edit.clear()
         self._mark_dirty()
@@ -418,6 +447,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
+        self._push_undo(f"Remove '{name}'")
         self.schematic.remove_block(name)
         self._mark_dirty()
         self.status_bar.showMessage(f"Removed '{name}' ({count:,} blocks → air).", 4000)

@@ -287,3 +287,23 @@ class Schematic:
             key = _make_item_key(name)
             new_items[key] = count
         self.required_items = new_items
+
+    # ------------------------------------------------------------------
+    # Undo / redo support
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        """Return a lightweight copy of all mutable state."""
+        import copy
+        return {
+            'blockstatemap': copy.deepcopy(self.blockstatemap),
+            'statelist': self.statelist.copy(),
+            'required_items': self.required_items.copy(),
+        }
+
+    def restore(self, snap: dict):
+        """Restore mutable state from a snapshot produced by :meth:`snapshot`."""
+        import copy
+        self.blockstatemap = copy.deepcopy(snap['blockstatemap'])
+        self.statelist = snap['statelist'].copy()
+        self.required_items = snap['required_items'].copy()
